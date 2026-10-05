@@ -26,7 +26,7 @@ jobs:
 
       - name: Buat proyek mod
         run: |
-          mkdir -p waypoint/src/main/java/com/waypointmod waypoint/src/main/resources/assets/waypointmod/lang
+          mkdir -p waypoint/src/main/java/com/waypointmod/mixin waypoint/src/main/resources/assets/waypointmod/lang
           cd waypoint
 
           cat > settings.gradle <<'EOF'
@@ -94,17 +94,31 @@ jobs:
             "id": "waypointmod",
             "version": "${version}",
             "name": "Waypoints",
-            "description": "Waypoint ringan: B tambah, U daftar. Keybind bisa diubah di menu Controls.",
+            "description": "Waypoint ringan: B tambah, U daftar, marker di dunia. Keybind bisa diubah di menu Controls.",
             "license": "MIT",
             "environment": "client",
             "entrypoints": {
               "client": ["com.waypointmod.WaypointClient"]
             },
+            "mixins": ["waypointmod.mixins.json"],
             "depends": {
               "fabricloader": ">=0.17.0",
               "fabric-api": "*",
               "minecraft": "1.21.10",
               "java": ">=21"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/waypointmod.mixins.json <<'EOF'
+          {
+            "required": false,
+            "minVersion": "0.8",
+            "package": "com.waypointmod.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["InGameHudMixin"],
+            "injectors": {
+              "defaultRequire": 0
             }
           }
           EOF
@@ -254,6 +268,389 @@ jobs:
           }
           EOF
 
+          cat > src/main/java/com/waypointmod/MarkerSettings.java <<'EOF'
+          package com.waypointmod;
+
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+
+          // Pengaturan marker waypoint di dunia. Semua disimpan ke file.
+          public final class MarkerSettings {
+              public static volatile boolean enabled = true;
+              public static volatile int size = 14;             // 10..32 piksel
+              public static volatile float opacity = 0.65f;     // 0.2..1.0
+              public static volatile boolean showName = true;
+              public static volatile boolean showDistance = true;
+              public static volatile int maxDistance = 0;       // 0 = tanpa batas
+              public static volatile int hideNear = 0;          // 0 = mati; sembunyikan marker kalau lebih dekat dari ini
+
+              private MarkerSettings() {}
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("waypointmod-marker.properties");
+              }
+
+              public static void load() {
+                  try {
+                      Path f = file();
+                      if (!Files.exists(f)) return;
+                      Properties p = new Properties();
+                      try (InputStream in = Files.newInputStream(f)) {
+                          p.load(in);
+                      }
+                      enabled = Boolean.parseBoolean(p.getProperty("enabled", "true"));
+                      size = Math.max(10, Math.min(32, Integer.parseInt(p.getProperty("size", "14"))));
+                      opacity = Math.max(0.2f, Math.min(1.0f, Float.parseFloat(p.getProperty("opacity", "0.65"))));
+                      showName = Boolean.parseBoolean(p.getProperty("showName", "true"));
+                      showDistance = Boolean.parseBoolean(p.getProperty("showDistance", "true"));
+                      maxDistance = Math.max(0, Math.min(2000, Integer.parseInt(p.getProperty("maxDistance", "0"))));
+                      hideNear = Math.max(0, Math.min(50, Integer.parseInt(p.getProperty("hideNear", "0"))));
+                  } catch (Throwable t) {
+                      System.err.println("[Waypoints] Gagal membaca pengaturan marker: " + t);
+                  }
+              }
+
+              public static void save() {
+                  try {
+                      Properties p = new Properties();
+                      p.setProperty("enabled", Boolean.toString(enabled));
+                      p.setProperty("size", Integer.toString(size));
+                      p.setProperty("opacity", Float.toString(opacity));
+                      p.setProperty("showName", Boolean.toString(showName));
+                      p.setProperty("showDistance", Boolean.toString(showDistance));
+                      p.setProperty("maxDistance", Integer.toString(maxDistance));
+                      p.setProperty("hideNear", Integer.toString(hideNear));
+                      try (OutputStream out = Files.newOutputStream(file())) {
+                          p.store(out, "Waypoint markers");
+                      }
+                  } catch (Throwable t) {
+                      System.err.println("[Waypoints] Gagal menyimpan pengaturan marker: " + t);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/WaypointMarkers.java <<'EOF'
+          package com.waypointmod;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+          import net.minecraft.util.math.Vec3d;
+
+          import java.util.Locale;
+
+          // Gambar marker waypoint di layar: titik di dunia diproyeksikan ke koordinat layar,
+          // lalu digambar sebagai kotak berwarna agak transparan berisi inisial kapital.
+          public final class WaypointMarkers {
+              // Diagnosa untuk layar Settings.
+              public static volatile long hookCalls = 0;
+              public static volatile long drawn = 0;
+
+              private WaypointMarkers() {}
+
+              public static void draw(DrawContext ctx, MinecraftClient mc) {
+                  hookCalls++;
+                  if (mc == null || !MarkerSettings.enabled) return;
+                  if (mc.player == null || mc.world == null || mc.currentScreen != null) return;
+                  if (mc.options.hudHidden) return;
+
+                  String dim = Dims.current(mc);
+                  Camera cam = mc.gameRenderer.getCamera();
+                  Vec3d c = cam.getPos();
+
+                  // Arah kamera: yaw 0 = menghadap selatan (+z), pitch positif = menunduk.
+                  double yaw = Math.toRadians(cam.getYaw());
+                  double pitch = Math.toRadians(cam.getPitch());
+                  double sy = Math.sin(yaw);
+                  double cy = Math.cos(yaw);
+                  double sp = Math.sin(pitch);
+                  double cp = Math.cos(pitch);
+                  double fx = -sy * cp;
+                  double fy = -sp;
+                  double fz = cy * cp;
+                  double rx = -cy;
+                  double rz = -sy;
+                  double ux = -sy * sp;
+                  double uy = cp;
+                  double uz = cy * sp;
+
+                  int sw = ctx.getScaledWindowWidth();
+                  int sh = ctx.getScaledWindowHeight();
+                  double tanHalf = Math.tan(Math.toRadians(mc.options.getFov().getValue()) / 2.0);
+                  double aspect = (double) sw / (double) sh;
+
+                  double px = mc.player.getX();
+                  double py = mc.player.getY();
+                  double pz = mc.player.getZ();
+
+                  int size = MarkerSettings.size;
+                  int alpha = Math.round(MarkerSettings.opacity * 255f);
+
+                  for (WaypointStore.Waypoint w : WaypointStore.all(mc)) {
+                      if (!dim.equals(w.dim)) continue;
+
+                      // Jarak ke pemain
+                      double ddx = w.x + 0.5 - px;
+                      double ddy = w.y - py;
+                      double ddz = w.z + 0.5 - pz;
+                      double dist = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                      if (MarkerSettings.maxDistance > 0 && dist > MarkerSettings.maxDistance) continue;
+                      if (MarkerSettings.hideNear > 0 && dist < MarkerSettings.hideNear) continue;
+
+                      // Titik marker: di atas blok waypoint, setinggi mata
+                      double dx = w.x + 0.5 - c.x;
+                      double dy = w.y + 1.5 - c.y;
+                      double dz = w.z + 0.5 - c.z;
+
+                      double depth = dx * fx + dy * fy + dz * fz;
+                      if (depth < 0.1) continue; // di belakang kamera
+
+                      double camX = dx * rx + dz * rz;
+                      double camY = dx * ux + dy * uy + dz * uz;
+                      double ndcX = (camX / depth) / (tanHalf * aspect);
+                      double ndcY = (camY / depth) / tanHalf;
+
+                      int cxs = (int) Math.round((ndcX * 0.5 + 0.5) * sw);
+                      int cys = (int) Math.round((0.5 - ndcY * 0.5) * sh);
+                      if (cxs < -size || cxs > sw + size || cys < -size || cys > sh + size) continue;
+
+                      drawMarker(ctx, mc, w, cxs, cys, size, alpha, dist);
+                      drawn++;
+                  }
+              }
+
+              private static void drawMarker(DrawContext ctx, MinecraftClient mc, WaypointStore.Waypoint w,
+                                             int cx, int cy, int size, int alpha, double dist) {
+                  int x = cx - size / 2;
+                  int y = cy - size / 2;
+                  int rgb = w.color & 0xFFFFFF;
+
+                  // Kotak: bingkai gelap lalu isi berwarna agak transparan.
+                  int border = Math.min(255, alpha + 50) << 24;
+                  int fill = (alpha << 24) | rgb;
+                  ctx.fill(x - 1, y - 1, x + size + 1, y + size + 1, border);
+                  ctx.fill(x, y, x + size, y + size, fill);
+
+                  // Inisial kapital, bold, di tengah kotak. Warna teks mengikuti terang gelapnya kotak.
+                  String initial = initialOf(w.name);
+                  Text letter = Text.literal(initial).formatted(Formatting.BOLD);
+                  int lw = mc.textRenderer.getWidth(letter);
+                  int r = (rgb >> 16) & 255;
+                  int g = (rgb >> 8) & 255;
+                  int b = rgb & 255;
+                  boolean lightBox = (0.299 * r + 0.587 * g + 0.114 * b) > 150;
+                  int textColor = lightBox ? 0xFF111111 : 0xFFFFFFFF;
+                  ctx.drawText(mc.textRenderer, letter, x + (size - lw) / 2, y + (size - 8) / 2 + 1, textColor, !lightBox);
+
+                  // Nama dan jarak di bawah kotak
+                  int ty = y + size + 3;
+                  if (MarkerSettings.showName) {
+                      Text name = Text.literal(w.name);
+                      int nw = mc.textRenderer.getWidth(name);
+                      ctx.drawText(mc.textRenderer, name, cx - nw / 2, ty, 0xFF000000 | rgb, true);
+                      ty += 10;
+                  }
+                  if (MarkerSettings.showDistance) {
+                      long d = Math.round(dist);
+                      String ds = d >= 1000 ? String.format(Locale.ROOT, "%.1fk m", d / 1000.0) : d + " m";
+                      Text dt = Text.literal(ds);
+                      int dw = mc.textRenderer.getWidth(dt);
+                      ctx.drawText(mc.textRenderer, dt, cx - dw / 2, ty, 0xFFDDDDDD, true);
+                  }
+              }
+
+              private static String initialOf(String name) {
+                  if (name == null) return "?";
+                  String t = name.trim();
+                  if (t.isEmpty()) return "?";
+                  int cp = Character.toUpperCase(t.codePointAt(0));
+                  return new String(Character.toChars(cp));
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/MarkerSettingsScreen.java <<'EOF'
+          package com.waypointmod;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.SliderWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.function.DoubleConsumer;
+          import java.util.function.DoubleFunction;
+
+          // Pengaturan marker waypoint: ukuran, opasitas, nama, jarak, dan lain-lain.
+          public class MarkerSettingsScreen extends Screen {
+              private final Screen parent;
+              private ButtonWidget markerButton;
+              private ButtonWidget nameButton;
+              private ButtonWidget distButton;
+
+              public MarkerSettingsScreen(Screen parent) {
+                  super(Text.literal("Pengaturan Marker"));
+                  this.parent = parent;
+              }
+
+              private static Text onOff(String label, boolean on) {
+                  return Text.literal(label + ": " + (on ? "ON" : "OFF"));
+              }
+
+              private static int maxDistOf(double v) {
+                  return (int) (Math.round(v * 40) * 50);
+              }
+
+              @Override
+              protected void init() {
+                  int h = 20;
+                  int step = 24;
+                  int colW = Math.max(100, Math.min(150, (this.width - 30) / 2));
+                  int leftX = this.width / 2 - colW - 3;
+                  int rightX = this.width / 2 + 3;
+                  int y = this.height / 2 - 56;
+
+                  // Kolom kiri
+                  markerButton = ButtonWidget.builder(onOff("Marker", MarkerSettings.enabled), button -> {
+                      MarkerSettings.enabled = !MarkerSettings.enabled;
+                      MarkerSettings.save();
+                  }).dimensions(leftX, y, colW, h).build();
+                  this.addDrawableChild(markerButton);
+
+                  this.addDrawableChild(new ValueSlider(leftX, y + step, colW, h, "Ukuran: ",
+                      (MarkerSettings.size - 10) / 22.0,
+                      v -> Integer.toString(10 + (int) Math.round(v * 22)),
+                      v -> {
+                          MarkerSettings.size = 10 + (int) Math.round(v * 22);
+                          MarkerSettings.save();
+                      }));
+
+                  this.addDrawableChild(new ValueSlider(leftX, y + step * 2, colW, h, "Opasitas: ",
+                      (MarkerSettings.opacity - 0.2) / 0.8,
+                      v -> Math.round((0.2 + 0.8 * v) * 100) + "%",
+                      v -> {
+                          MarkerSettings.opacity = (float) (0.2 + 0.8 * v);
+                          MarkerSettings.save();
+                      }));
+
+                  this.addDrawableChild(new ValueSlider(leftX, y + step * 3, colW, h, "Jarak maks: ",
+                      MarkerSettings.maxDistance / 2000.0,
+                      v -> maxDistOf(v) == 0 ? "Bebas" : maxDistOf(v) + " m",
+                      v -> {
+                          MarkerSettings.maxDistance = maxDistOf(v);
+                          MarkerSettings.save();
+                      }));
+
+                  // Kolom kanan
+                  nameButton = ButtonWidget.builder(onOff("Nama", MarkerSettings.showName), button -> {
+                      MarkerSettings.showName = !MarkerSettings.showName;
+                      MarkerSettings.save();
+                  }).dimensions(rightX, y, colW, h).build();
+                  this.addDrawableChild(nameButton);
+
+                  distButton = ButtonWidget.builder(onOff("Jarak", MarkerSettings.showDistance), button -> {
+                      MarkerSettings.showDistance = !MarkerSettings.showDistance;
+                      MarkerSettings.save();
+                  }).dimensions(rightX, y + step, colW, h).build();
+                  this.addDrawableChild(distButton);
+
+                  this.addDrawableChild(new ValueSlider(rightX, y + step * 2, colW, h, "Sembunyi dekat: ",
+                      MarkerSettings.hideNear / 50.0,
+                      v -> Math.round(v * 50) == 0 ? "Mati" : Math.round(v * 50) + " m",
+                      v -> {
+                          MarkerSettings.hideNear = (int) Math.round(v * 50);
+                          MarkerSettings.save();
+                      }));
+
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Selesai"), button -> this.close())
+                      .dimensions(this.width / 2 - 60, y + step * 4 + 6, 120, h).build());
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                  if (markerButton != null) markerButton.setMessage(onOff("Marker", MarkerSettings.enabled));
+                  if (nameButton != null) nameButton.setMessage(onOff("Nama", MarkerSettings.showName));
+                  if (distButton != null) distButton.setMessage(onOff("Jarak", MarkerSettings.showDistance));
+
+                  super.render(context, mouseX, mouseY, delta);
+                  int cx = this.width / 2;
+                  int top = this.height / 2 - 56;
+                  context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, top - 18, 0xFFFFFFFF);
+                  context.drawCenteredTextWithShadow(this.textRenderer,
+                      Text.literal("Diagnosa: hook " + WaypointMarkers.hookCalls + ", marker tergambar " + WaypointMarkers.drawn),
+                      cx, top + 24 * 4 + 32, 0xFFAAAAAA);
+              }
+
+              @Override
+              public void close() {
+                  if (this.client != null) {
+                      this.client.setScreen(this.parent);
+                  }
+              }
+
+              // Slider serbaguna: nilai 0..1, label dan aksi diatur lewat parameter.
+              private static class ValueSlider extends SliderWidget {
+                  private final String label;
+                  private final DoubleFunction<String> format;
+                  private final DoubleConsumer onChange;
+
+                  ValueSlider(int x, int y, int w, int h, String label, double initial,
+                              DoubleFunction<String> format, DoubleConsumer onChange) {
+                      super(x, y, w, h, Text.empty(), Math.max(0.0, Math.min(1.0, initial)));
+                      this.label = label;
+                      this.format = format;
+                      this.onChange = onChange;
+                      updateMessage();
+                  }
+
+                  @Override
+                  protected void updateMessage() {
+                      setMessage(Text.literal(this.label + this.format.apply(this.value)));
+                  }
+
+                  @Override
+                  protected void applyValue() {
+                      this.onChange.accept(this.value);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/mixin/InGameHudMixin.java <<'EOF'
+          package com.waypointmod.mixin;
+
+          import com.waypointmod.WaypointMarkers;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.hud.InGameHud;
+          import net.minecraft.client.render.RenderTickCounter;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(InGameHud.class)
+          public abstract class InGameHudMixin {
+              // Gambar marker waypoint di atas HUD.
+              // require = 0 dan try/catch: kalau tidak cocok, mod diam saja, game tidak crash.
+              @Inject(method = "render", at = @At("TAIL"), require = 0)
+              private void waypointmod$markers(DrawContext context, RenderTickCounter tickCounter, CallbackInfo ci) {
+                  try {
+                      WaypointMarkers.draw(context, MinecraftClient.getInstance());
+                  } catch (Throwable ignored) {
+                  }
+              }
+          }
+          EOF
+
           cat > src/main/java/com/waypointmod/WaypointClient.java <<'EOF'
           package com.waypointmod;
 
@@ -271,6 +668,8 @@ jobs:
 
               @Override
               public void onInitializeClient() {
+                  MarkerSettings.load();
+
                   // Muncul di menu Options > Controls > Key Binds, kategori "Waypoints".
                   KeyBinding.Category category = KeyBinding.Category.create(Identifier.of("waypointmod", "waypoints"));
                   addKey = KeyBindingHelper.registerKeyBinding(
@@ -599,6 +998,11 @@ jobs:
 
                   this.addDrawableChild(ButtonWidget.builder(Text.literal("Tutup"), button -> this.close())
                       .dimensions(x0 + bw + 4, by, bw, 20).build());
+
+                  // Pojok kiri bawah layar: pengaturan marker
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Settings"), button ->
+                      this.client.setScreen(new MarkerSettingsScreen(this)))
+                      .dimensions(6, this.height - 26, 70, 20).build());
               }
 
               @Override
