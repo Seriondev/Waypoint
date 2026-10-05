@@ -1,4 +1,4 @@
-name: Build Waypoint Mod
+name: Build Waypoint Mod (1.21.11)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.14.3
+          gradle-version: 9.2.1
 
       - name: Buat proyek mod
         run: |
@@ -41,12 +41,12 @@ jobs:
 
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx2G
-          minecraft_version=1.21.10
-          yarn_mappings=1.21.10+build.3
-          loader_version=0.17.3
-          loom_version=1.11-SNAPSHOT
-          fabric_version=0.138.4+1.21.10
-          mod_version=1.0.0
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.4
+          loader_version=0.18.4
+          loom_version=1.15-SNAPSHOT
+          fabric_version=0.141.3+1.21.11
+          mod_version=1.0.0-mc1.21.11
           maven_group=com.waypointmod
           archives_base_name=waypointmod
           EOF
@@ -102,9 +102,9 @@ jobs:
             },
             "mixins": ["waypointmod.mixins.json"],
             "depends": {
-              "fabricloader": ">=0.17.0",
+              "fabricloader": ">=0.18.0",
               "fabric-api": "*",
-              "minecraft": "1.21.10",
+              "minecraft": "1.21.11",
               "java": ">=21"
             }
           }
@@ -179,6 +179,7 @@ jobs:
           import java.util.List;
 
           // Penyimpanan waypoint: satu file JSON per dunia (singleplayer) atau per server.
+          // Format file sama dengan versi 1.21.10, jadi waypoint lama tetap terbaca.
           public final class WaypointStore {
               public static final class Waypoint {
                   public String name;
@@ -364,10 +365,11 @@ jobs:
 
                   String dim = Dims.current(mc);
                   Camera cam = mc.gameRenderer.getCamera();
-                  Vec3d c = cam.getPos();
+                  // Di 1.21.11 nama method kamera berubah: getPos -> getCameraPos, getYaw -> getCameraYaw.
+                  Vec3d c = cam.getCameraPos();
 
                   // Arah kamera: yaw 0 = menghadap selatan (+z), pitch positif = menunduk.
-                  double yaw = Math.toRadians(cam.getYaw());
+                  double yaw = Math.toRadians(cam.getCameraYaw());
                   double pitch = Math.toRadians(cam.getPitch());
                   double sy = Math.sin(yaw);
                   double cy = Math.cos(yaw);
@@ -1066,11 +1068,11 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: waypoint-mod
-          path: waypoint/build/libs/waypointmod-1.0.0.jar
+          name: waypoint-mod-1.21.11
+          path: waypoint/build/libs/waypointmod-1.0.0-mc1.21.11.jar
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: waypoint-${{ github.run_number }}
-          name: Waypoint Mod build ${{ github.run_number }}
-          files: waypoint/build/libs/waypointmod-1.0.0.jar
+          tag_name: waypoint-1.21.11-${{ github.run_number }}
+          name: Waypoint Mod (MC 1.21.11) build ${{ github.run_number }}
+          files: waypoint/build/libs/waypointmod-1.0.0-mc1.21.11.jar
