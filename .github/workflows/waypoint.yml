@@ -1,0 +1,672 @@
+name: Build Waypoint Mod
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/waypoint.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Buat proyek mod
+        run: |
+          mkdir -p waypoint/src/main/java/com/waypointmod waypoint/src/main/resources/assets/waypointmod/lang
+          cd waypoint
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.10
+          yarn_mappings=1.21.10+build.3
+          loader_version=0.17.3
+          loom_version=1.11-SNAPSHOT
+          fabric_version=0.138.4+1.21.10
+          mod_version=1.0.0
+          maven_group=com.waypointmod
+          archives_base_name=waypointmod
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version "${loom_version}"
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              // Fabric API dibutuhkan untuk keybind dan event tick.
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "waypointmod",
+            "version": "${version}",
+            "name": "Waypoints",
+            "description": "Waypoint ringan: B tambah, U daftar. Keybind bisa diubah di menu Controls.",
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.waypointmod.WaypointClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.17.0",
+              "fabric-api": "*",
+              "minecraft": "1.21.10",
+              "java": ">=21"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/assets/waypointmod/lang/en_us.json <<'EOF'
+          {
+            "key.category.waypointmod.waypoints": "Waypoints",
+            "key.waypointmod.add": "Add Waypoint",
+            "key.waypointmod.list": "Waypoint List"
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/Dims.java <<'EOF'
+          package com.waypointmod;
+
+          import net.minecraft.client.MinecraftClient;
+
+          // Tiga dimensi yang punya tab sendiri di daftar waypoint.
+          final class Dims {
+              static final String[] IDS = {"minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"};
+              static final String[] NAMES = {"Overworld", "Nether", "The End"};
+
+              private Dims() {}
+
+              static String current(MinecraftClient mc) {
+                  try {
+                      return mc.world.getRegistryKey().getValue().toString();
+                  } catch (Throwable t) {
+                      return IDS[0];
+                  }
+              }
+
+              static int indexOf(String id) {
+                  for (int i = 0; i < IDS.length; i++) {
+                      if (IDS[i].equals(id)) return i;
+                  }
+                  return -1;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/WaypointStore.java <<'EOF'
+          package com.waypointmod;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.google.gson.reflect.TypeToken;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ServerInfo;
+          import net.minecraft.util.WorldSavePath;
+
+          import java.lang.reflect.Type;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          // Penyimpanan waypoint: satu file JSON per dunia (singleplayer) atau per server.
+          public final class WaypointStore {
+              public static final class Waypoint {
+                  public String name;
+                  public int x;
+                  public int y;
+                  public int z;
+                  public int color;
+                  public String dim;
+              }
+
+              public static final int[] COLORS = {
+                  0xFF5555, 0xFFAA00, 0xFFFF55, 0x55FF55, 0x55FFFF, 0x5555FF,
+                  0xAA55FF, 0xFF55FF, 0xFFFFFF, 0xAAAAAA, 0xA0522D
+              };
+              public static final String[] COLOR_NAMES = {
+                  "Merah", "Oranye", "Kuning", "Hijau", "Cyan", "Biru",
+                  "Ungu", "Pink", "Putih", "Abu-abu", "Coklat"
+              };
+
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Type LIST_TYPE = new TypeToken<List<Waypoint>>() {}.getType();
+
+              private static String loadedKey = null;
+              private static List<Waypoint> list = new ArrayList<>();
+
+              private WaypointStore() {}
+
+              static String worldKey(MinecraftClient mc) {
+                  try {
+                      if (mc.isInSingleplayer() && mc.getServer() != null) {
+                          Path name = mc.getServer().getSavePath(WorldSavePath.ROOT).normalize().getFileName();
+                          if (name != null) return "sp_" + name;
+                      }
+                      ServerInfo info = mc.getCurrentServerEntry();
+                      if (info != null && info.address != null) return "mp_" + info.address;
+                  } catch (Throwable ignored) {
+                  }
+                  return "unknown";
+              }
+
+              private static Path fileFor(String key) {
+                  String safe = key.replaceAll("[^a-zA-Z0-9._-]", "_");
+                  return FabricLoader.getInstance().getConfigDir().resolve("waypoints").resolve(safe + ".json");
+              }
+
+              private static List<Waypoint> read(String key) {
+                  try {
+                      Path f = fileFor(key);
+                      if (!Files.exists(f)) return new ArrayList<>();
+                      List<Waypoint> r = GSON.fromJson(Files.readString(f, StandardCharsets.UTF_8), LIST_TYPE);
+                      return r != null ? new ArrayList<>(r) : new ArrayList<>();
+                  } catch (Throwable t) {
+                      System.err.println("[Waypoints] Gagal membaca waypoint: " + t);
+                      return new ArrayList<>();
+                  }
+              }
+
+              public static synchronized List<Waypoint> all(MinecraftClient mc) {
+                  String key = worldKey(mc);
+                  if (!key.equals(loadedKey)) {
+                      list = read(key);
+                      loadedKey = key;
+                  }
+                  return list;
+              }
+
+              public static synchronized void save(MinecraftClient mc) {
+                  try {
+                      String key = worldKey(mc);
+                      Path f = fileFor(key);
+                      Files.createDirectories(f.getParent());
+                      Files.writeString(f, GSON.toJson(list, LIST_TYPE), StandardCharsets.UTF_8);
+                  } catch (Throwable t) {
+                      System.err.println("[Waypoints] Gagal menyimpan waypoint: " + t);
+                  }
+              }
+
+              public static synchronized void add(MinecraftClient mc, Waypoint w) {
+                  all(mc).add(w);
+                  save(mc);
+              }
+
+              public static synchronized void remove(MinecraftClient mc, Waypoint w) {
+                  all(mc).remove(w);
+                  save(mc);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/WaypointClient.java <<'EOF'
+          package com.waypointmod;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.util.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class WaypointClient implements ClientModInitializer {
+              private static KeyBinding addKey;
+              private static KeyBinding listKey;
+
+              @Override
+              public void onInitializeClient() {
+                  // Muncul di menu Options > Controls > Key Binds, kategori "Waypoints".
+                  KeyBinding.Category category = KeyBinding.Category.create(Identifier.of("waypointmod", "waypoints"));
+                  addKey = KeyBindingHelper.registerKeyBinding(
+                      new KeyBinding("key.waypointmod.add", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_B, category));
+                  listKey = KeyBindingHelper.registerKeyBinding(
+                      new KeyBinding("key.waypointmod.list", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_U, category));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      try {
+                          while (addKey.wasPressed()) {
+                              if (client.currentScreen == null && client.world != null && client.player != null) {
+                                  client.setScreen(new AddWaypointScreen(null, null));
+                              }
+                          }
+                          while (listKey.wasPressed()) {
+                              if (client.currentScreen == null && client.world != null && client.player != null) {
+                                  client.setScreen(new WaypointListScreen(null));
+                              }
+                          }
+                      } catch (Throwable t) {
+                          System.err.println("[Waypoints] Error saat membuka menu: " + t);
+                      }
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/AddWaypointScreen.java <<'EOF'
+          package com.waypointmod;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+
+          // Tambah atau edit waypoint: nama, koordinat (kosong = posisi sekarang), warna, dimensi.
+          public class AddWaypointScreen extends Screen {
+              private final Screen parent;
+              private final WaypointStore.Waypoint editing;
+
+              private TextFieldWidget nameField;
+              private TextFieldWidget xField;
+              private TextFieldWidget yField;
+              private TextFieldWidget zField;
+              private ButtonWidget colorButton;
+              private ButtonWidget dimButton;
+
+              private int colorIndex = 0;
+              private int dimIndex = 0;
+              private String error = "";
+
+              public AddWaypointScreen(Screen parent, WaypointStore.Waypoint editing) {
+                  super(Text.literal(editing == null ? "Tambah Waypoint" : "Edit Waypoint"));
+                  this.parent = parent;
+                  this.editing = editing;
+                  if (editing != null) {
+                      for (int i = 0; i < WaypointStore.COLORS.length; i++) {
+                          if (WaypointStore.COLORS[i] == editing.color) colorIndex = i;
+                      }
+                      dimIndex = Math.max(0, Dims.indexOf(editing.dim));
+                  } else {
+                      dimIndex = Math.max(0, Dims.indexOf(Dims.current(MinecraftClient.getInstance())));
+                  }
+              }
+
+              private Text colorLabel() {
+                  return Text.literal("Warna: " + WaypointStore.COLOR_NAMES[colorIndex]);
+              }
+
+              private Text dimLabel() {
+                  return Text.literal("Dimensi: " + Dims.NAMES[dimIndex]);
+              }
+
+              private TextFieldWidget coordField(int x, int y, int w, String label, String placeholder, String initial) {
+                  TextFieldWidget f = new TextFieldWidget(this.textRenderer, x, y, w, 20, Text.literal(label));
+                  f.setMaxLength(9);
+                  f.setTextPredicate(s -> s.matches("-?\\d{0,8}"));
+                  f.setPlaceholder(Text.literal(placeholder));
+                  f.setText(initial);
+                  this.addDrawableChild(f);
+                  return f;
+              }
+
+              @Override
+              protected void init() {
+                  MinecraftClient mc = this.client;
+                  int px = 0;
+                  int py = 0;
+                  int pz = 0;
+                  if (mc != null && mc.player != null) {
+                      px = (int) Math.floor(mc.player.getX());
+                      py = (int) Math.floor(mc.player.getY());
+                      pz = (int) Math.floor(mc.player.getZ());
+                  }
+
+                  int cw = Math.min(220, this.width - 20);
+                  int x0 = this.width / 2 - cw / 2;
+                  int y = this.height / 2 - 62;
+
+                  nameField = new TextFieldWidget(this.textRenderer, x0, y, cw, 20, Text.literal("Nama"));
+                  nameField.setMaxLength(24);
+                  nameField.setPlaceholder(Text.literal("Nama waypoint"));
+                  if (editing != null) nameField.setText(editing.name);
+                  this.addDrawableChild(nameField);
+
+                  int fw = (cw - 8) / 3;
+                  xField = coordField(x0, y + 26, fw, "X", "X " + px, editing != null ? String.valueOf(editing.x) : "");
+                  yField = coordField(x0 + fw + 4, y + 26, fw, "Y", "Y " + py, editing != null ? String.valueOf(editing.y) : "");
+                  zField = coordField(x0 + (fw + 4) * 2, y + 26, fw, "Z", "Z " + pz, editing != null ? String.valueOf(editing.z) : "");
+
+                  int half = (cw - 4) / 2;
+                  colorButton = ButtonWidget.builder(colorLabel(), button -> {
+                      colorIndex = (colorIndex + 1) % WaypointStore.COLORS.length;
+                      button.setMessage(colorLabel());
+                  }).dimensions(x0, y + 52, half, 20).build();
+                  this.addDrawableChild(colorButton);
+
+                  dimButton = ButtonWidget.builder(dimLabel(), button -> {
+                      dimIndex = (dimIndex + 1) % Dims.IDS.length;
+                      button.setMessage(dimLabel());
+                  }).dimensions(x0 + half + 4, y + 52, half, 20).build();
+                  this.addDrawableChild(dimButton);
+
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Simpan"), button -> save())
+                      .dimensions(x0, y + 80, half, 20).build());
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Batal"), button -> this.close())
+                      .dimensions(x0 + half + 4, y + 80, half, 20).build());
+              }
+
+              private static Integer parse(TextFieldWidget f) {
+                  String t = f.getText().trim();
+                  if (t.isEmpty() || t.equals("-")) return null;
+                  try {
+                      return Integer.parseInt(t);
+                  } catch (NumberFormatException e) {
+                      return null;
+                  }
+              }
+
+              private void save() {
+                  MinecraftClient mc = this.client;
+                  if (mc == null || mc.player == null || mc.world == null) {
+                      this.close();
+                      return;
+                  }
+                  String dim = Dims.IDS[dimIndex];
+                  boolean sameDim = dim.equals(Dims.current(mc));
+
+                  Integer x = parse(xField);
+                  Integer y = parse(yField);
+                  Integer z = parse(zField);
+                  if ((x == null || y == null || z == null) && !sameDim) {
+                      error = "Isi X, Y, Z untuk dimensi lain";
+                      return;
+                  }
+                  // Kolom kosong = posisi tempat berdiri sekarang.
+                  if (x == null) x = (int) Math.floor(mc.player.getX());
+                  if (y == null) y = (int) Math.floor(mc.player.getY());
+                  if (z == null) z = (int) Math.floor(mc.player.getZ());
+
+                  String name = nameField.getText().trim();
+                  if (name.isEmpty()) {
+                      name = "Waypoint " + (WaypointStore.all(mc).size() + 1);
+                  }
+
+                  WaypointStore.Waypoint w = editing != null ? editing : new WaypointStore.Waypoint();
+                  w.name = name;
+                  w.x = x;
+                  w.y = y;
+                  w.z = z;
+                  w.color = WaypointStore.COLORS[colorIndex];
+                  w.dim = dim;
+
+                  if (editing == null) {
+                      WaypointStore.add(mc, w);
+                  } else {
+                      WaypointStore.save(mc);
+                  }
+                  this.close();
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                  super.render(context, mouseX, mouseY, delta);
+                  int cx = this.width / 2;
+                  int top = this.height / 2 - 62;
+                  context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, top - 16, 0xFFFFFFFF);
+                  context.drawCenteredTextWithShadow(this.textRenderer,
+                      Text.literal("Kosongkan X, Y, Z untuk memakai posisimu sekarang"), cx, top + 106, 0xFFAAAAAA);
+                  if (!error.isEmpty()) {
+                      context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(error), cx, top + 118, 0xFFFF5555);
+                  }
+                  // Kotak kecil warna di dalam tombol warna.
+                  if (colorButton != null) {
+                      int bx = colorButton.getX() + colorButton.getWidth() - 14;
+                      int by = colorButton.getY() + 5;
+                      context.fill(bx - 1, by - 1, bx + 9, by + 11, 0xFF000000);
+                      context.fill(bx, by, bx + 8, by + 10, 0xFF000000 | WaypointStore.COLORS[colorIndex]);
+                  }
+              }
+
+              @Override
+              public void close() {
+                  if (this.client != null) {
+                      this.client.setScreen(this.parent);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/waypointmod/WaypointListScreen.java <<'EOF'
+          package com.waypointmod;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+
+          // Daftar waypoint dengan 3 tab: Overworld, Nether, The End.
+          public class WaypointListScreen extends Screen {
+              private static final int PER_PAGE = 4;
+              // Tab terakhir diingat selama game berjalan. -1 = ikuti dimensi sekarang.
+              private static int tab = -1;
+
+              private final Screen parent;
+              private final int page;
+              private final List<WaypointStore.Waypoint> shown = new ArrayList<>();
+              private final boolean[] armed = new boolean[PER_PAGE];
+
+              public WaypointListScreen(Screen parent) {
+                  this(parent, 0);
+              }
+
+              public WaypointListScreen(Screen parent, int page) {
+                  super(Text.literal("Waypoint"));
+                  this.parent = parent;
+                  this.page = Math.max(0, page);
+              }
+
+              private int pages() {
+                  return Math.max(1, (shown.size() + PER_PAGE - 1) / PER_PAGE);
+              }
+
+              private int curPage() {
+                  return Math.min(page, pages() - 1);
+              }
+
+              @Override
+              protected void init() {
+                  MinecraftClient mc = this.client;
+                  if (mc == null) return;
+                  if (tab < 0) tab = Math.max(0, Dims.indexOf(Dims.current(mc)));
+
+                  shown.clear();
+                  for (WaypointStore.Waypoint w : WaypointStore.all(mc)) {
+                      if (Dims.IDS[tab].equals(w.dim)) shown.add(w);
+                  }
+
+                  int cw = Math.min(280, this.width - 20);
+                  int x0 = this.width / 2 - cw / 2;
+                  int top = this.height / 2 - 92;
+
+                  // Tab dimensi
+                  int tw = (cw - 8) / 3;
+                  for (int t = 0; t < Dims.IDS.length; t++) {
+                      final int tt = t;
+                      ButtonWidget b = ButtonWidget.builder(Text.literal(Dims.NAMES[t]), button -> {
+                          tab = tt;
+                          this.client.setScreen(new WaypointListScreen(this.parent, 0));
+                      }).dimensions(x0 + t * (tw + 4), top, tw, 20).build();
+                      b.active = t != tab;
+                      this.addDrawableChild(b);
+                  }
+
+                  // Baris waypoint
+                  int start = curPage() * PER_PAGE;
+                  for (int i = 0; i < PER_PAGE; i++) {
+                      int idx = start + i;
+                      if (idx >= shown.size()) break;
+                      final int row = i;
+                      final WaypointStore.Waypoint w = shown.get(idx);
+                      int ry = top + 28 + i * 28;
+
+                      this.addDrawableChild(ButtonWidget.builder(Text.literal("Edit"), button ->
+                          this.client.setScreen(new AddWaypointScreen(this, w)))
+                          .dimensions(x0 + cw - 96, ry, 44, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(Text.literal("Hapus"), button -> {
+                          if (!armed[row]) {
+                              armed[row] = true;
+                              button.setMessage(Text.literal("Yakin?"));
+                          } else {
+                              WaypointStore.remove(this.client, w);
+                              this.client.setScreen(new WaypointListScreen(this.parent, this.page));
+                          }
+                      }).dimensions(x0 + cw - 48, ry, 48, 20).build());
+                  }
+
+                  // Navigasi halaman
+                  int navY = top + 28 + PER_PAGE * 28 + 2;
+                  ButtonWidget prev = ButtonWidget.builder(Text.literal("<"), button ->
+                      this.client.setScreen(new WaypointListScreen(this.parent, curPage() - 1)))
+                      .dimensions(x0, navY, 40, 20).build();
+                  prev.active = curPage() > 0;
+                  this.addDrawableChild(prev);
+
+                  ButtonWidget next = ButtonWidget.builder(Text.literal(">"), button ->
+                      this.client.setScreen(new WaypointListScreen(this.parent, curPage() + 1)))
+                      .dimensions(x0 + cw - 40, navY, 40, 20).build();
+                  next.active = curPage() + 1 < pages();
+                  this.addDrawableChild(next);
+
+                  // Baris bawah: tambah dan tutup
+                  int by = navY + 26;
+                  int bw = (cw - 4) / 2;
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Tambah"), button ->
+                      this.client.setScreen(new AddWaypointScreen(this, null)))
+                      .dimensions(x0, by, bw, 20).build());
+
+                  this.addDrawableChild(ButtonWidget.builder(Text.literal("Tutup"), button -> this.close())
+                      .dimensions(x0 + bw + 4, by, bw, 20).build());
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                  super.render(context, mouseX, mouseY, delta);
+                  MinecraftClient mc = this.client;
+                  int cw = Math.min(280, this.width - 20);
+                  int x0 = this.width / 2 - cw / 2;
+                  int top = this.height / 2 - 92;
+                  int cx = this.width / 2;
+
+                  context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, top - 14, 0xFFFFFFFF);
+
+                  if (shown.isEmpty()) {
+                      context.drawCenteredTextWithShadow(this.textRenderer,
+                          Text.literal("Belum ada waypoint di dimensi ini."), cx, top + 40, 0xFFAAAAAA);
+                  }
+
+                  boolean sameDim = mc != null && mc.player != null && Dims.IDS[tab].equals(Dims.current(mc));
+                  int start = curPage() * PER_PAGE;
+                  for (int i = 0; i < PER_PAGE; i++) {
+                      int idx = start + i;
+                      if (idx >= shown.size()) break;
+                      WaypointStore.Waypoint w = shown.get(idx);
+                      int ry = top + 28 + i * 28;
+
+                      // Kotak warna
+                      context.fill(x0, ry + 1, x0 + 10, ry + 11, 0xFF000000);
+                      context.fill(x0 + 1, ry + 2, x0 + 9, ry + 10, 0xFF000000 | w.color);
+
+                      String name = this.textRenderer.trimToWidth(w.name, cw - 96 - 16);
+                      context.drawText(this.textRenderer, Text.literal(name), x0 + 14, ry + 1, 0xFFFFFFFF, true);
+
+                      String info = w.x + ", " + w.y + ", " + w.z;
+                      if (sameDim) {
+                          double dx = w.x + 0.5 - mc.player.getX();
+                          double dy = w.y - mc.player.getY();
+                          double dz = w.z + 0.5 - mc.player.getZ();
+                          info += String.format(Locale.ROOT, "  (%d m)", Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz)));
+                      }
+                      context.drawText(this.textRenderer, Text.literal(info), x0 + 14, ry + 12, 0xFFAAAAAA, true);
+                  }
+
+                  int navY = top + 28 + PER_PAGE * 28 + 2;
+                  context.drawCenteredTextWithShadow(this.textRenderer,
+                      Text.literal((curPage() + 1) + "/" + pages()), cx, navY + 6, 0xFFFFFFFF);
+              }
+
+              @Override
+              public void close() {
+                  if (this.client != null) {
+                      this.client.setScreen(this.parent);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        working-directory: waypoint
+        run: gradle build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waypoint-mod
+          path: waypoint/build/libs/waypointmod-1.0.0.jar
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: waypoint-${{ github.run_number }}
+          name: Waypoint Mod build ${{ github.run_number }}
+          files: waypoint/build/libs/waypointmod-1.0.0.jar
